@@ -37,9 +37,12 @@ import com.google.api.client.util.ByteStreams;
 import com.google.api.client.util.Preconditions;
 import com.google.api.client.util.Sleeper;
 
+import javax.net.ssl.HttpsURLConnection;
 import java.io.BufferedInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URL;
 import java.util.Arrays;
 
 /**
@@ -477,6 +480,134 @@ public final class MediaHttpUploader {
           response.disconnect();
         }
       }
+    }
+  }
+
+  /**
+   * Uploads the media in a resumable manner.
+   *
+   * @param signURL The request URL where the initiation request will be sent
+   * @return HTTP response
+   */
+  public HttpResponse resumableUpload(URL signURL) throws IOException {
+    HttpResponse response = null;
+
+    // Make initial request to get the unique upload URL.
+    String url = executeResumeableUploadInitiation(signURL.toString());
+
+    GenericUrl uploadUrl = new GenericUrl(url);
+
+    // Convert media content into a byte stream to upload in chunks.
+    contentInputStream = mediaContent.getInputStream();
+    if (!contentInputStream.markSupported() && isMediaLengthKnown()) {
+      // If we know the media content length then wrap the stream into a Buffered input stream to
+      // support the {@link InputStream#mark} and {@link InputStream#reset} methods required for
+      // handling server errors.
+      contentInputStream = new BufferedInputStream(contentInputStream);
+    }
+
+    // Upload the media content in chunks.
+    while (true) {
+      ContentChunk contentChunk = buildContentChunk();
+      currentRequest = requestFactory.buildPutRequest(uploadUrl, null);
+      currentRequest.setContent(contentChunk.getContent());
+      currentRequest.getHeaders().setContentRange(contentChunk.getContentRange());
+
+      // set mediaErrorHandler as I/O exception handler and as unsuccessful response handler for
+      // calling to serverErrorCallback on an I/O exception or an abnormal HTTP response
+      new MediaUploadErrorHandler(this, currentRequest);
+
+      if (isMediaLengthKnown()) {
+        // TODO(rmistry): Support gzipping content for the case where media content length is
+        // known (https://github.com/googleapis/google-api-java-client/issues/691).
+        response = executeCurrentRequestWithoutGZip(currentRequest);
+      } else {
+        response = executeCurrentRequest(currentRequest);
+      }
+      boolean returningResponse = false;
+      try {
+        if (response.isSuccessStatusCode()) {
+          totalBytesServerReceived = getMediaContentLength();
+          if (mediaContent.getCloseInputStream()) {
+            contentInputStream.close();
+          }
+          updateStateAndNotifyListener(UploadState.MEDIA_COMPLETE);
+          returningResponse = true;
+          return response;
+        }
+
+        if (response.getStatusCode() != 308) {
+          returningResponse = true;
+          return response;
+        }
+
+        // Check to see if the upload URL has changed on the server.
+        String updatedUploadUrl = response.getHeaders().getLocation();
+        if (updatedUploadUrl != null) {
+          uploadUrl = new GenericUrl(updatedUploadUrl);
+        }
+
+        // we check the amount of bytes the server received so far, because the server may process
+        // fewer bytes than the amount of bytes the client had sent
+        long newBytesServerReceived = getNextByteIndex(response.getHeaders().getRange());
+        // the server can receive any amount of bytes from 0 to current chunk length
+        long currentBytesServerReceived = newBytesServerReceived - totalBytesServerReceived;
+        Preconditions.checkState(
+                currentBytesServerReceived >= 0 && currentBytesServerReceived <= currentChunkLength);
+        long copyBytes = currentChunkLength - currentBytesServerReceived;
+        if (isMediaLengthKnown()) {
+          if (copyBytes > 0) {
+            // If the server didn't receive all the bytes the client sent the current position of
+            // the input stream is incorrect. So we should reset the stream and skip those bytes
+            // that the server had already received.
+            // Otherwise (the server got all bytes the client sent), the stream is in its right
+            // position, and we can continue from there
+            contentInputStream.reset();
+            long actualSkipValue = contentInputStream.skip(currentBytesServerReceived);
+            Preconditions.checkState(currentBytesServerReceived == actualSkipValue);
+          }
+        } else if (copyBytes == 0) {
+          // server got all the bytes, so we don't need to use this buffer. Otherwise, we have to
+          // keep the buffer and copy part (or all) of its bytes to the stream we are sending to the
+          // server
+          currentRequestContentBuffer = null;
+        }
+        totalBytesServerReceived = newBytesServerReceived;
+
+        updateStateAndNotifyListener(UploadState.MEDIA_IN_PROGRESS);
+      } finally {
+        if (!returningResponse) {
+          response.disconnect();
+        }
+      }
+    }
+  }
+
+  /**
+   * This method sends a POST request with empty content to get the unique upload URL.
+   *
+   * @param url The request URL where the initiation request will be sent
+   */
+  private String executeResumeableUploadInitiation(String url) {
+    try {
+      URL obj = new URL(url);
+      HttpsURLConnection con = (HttpsURLConnection) obj.openConnection();
+
+      con.setRequestMethod("POST");
+      con.setRequestProperty("content-type", getMediaContent().getType());
+      con.setRequestProperty("x-goog-resumable", "start");
+
+      String urlParameters = "";
+      con.setDoOutput(true);
+      DataOutputStream wr = new DataOutputStream(con.getOutputStream());
+      wr.writeBytes(urlParameters);
+      wr.flush();
+      wr.close();
+
+      return con.getHeaderField("Location");
+    } catch (Exception ex) {
+      ex.printStackTrace();
+      return null;
     }
   }
 
